@@ -15,6 +15,8 @@ import httpx
 from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
 import secrets
+import smtplib
+from email.message import EmailMessage
 
 # Load .env from backend folder or project root
 env_path = Path(__file__).parent / ".env"
@@ -29,6 +31,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "llama-3.3-70b-versatile"
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() in {"1", "true", "yes"}
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
 
 app = FastAPI(title="AI Code Review API")
 
@@ -177,13 +185,19 @@ async def signup(request: SignupRequest):
         "attempts": 0,
         "verified": False,
     }
+    sent = await _send_verification_email(email, code)
     return JSONResponse(
         {
             "ok": True,
             "message": "Account created",
             "user": {"email": email, "name": name, "id": f"user_{abs(hash(email))%10_000_000}"},
             "token": "demo-token",
-            "verification": {"sent": True, "method": "code", **({"dev_code": code} if DEV_MODE else {})},
+            "verification": {
+                "sent": True,
+                "email_sent": bool(sent),
+                "method": "code",
+                **({"dev_code": code} if DEV_MODE else {}),
+            },
         }
     )
 
@@ -215,9 +229,11 @@ async def send_code(request: SendCodeRequest):
         "attempts": 0,
         "verified": False,
     }
+    sent = await _send_verification_email(email, code)
     return {
         "ok": True,
         "message": "Verification code sent",
+        "email_sent": bool(sent),
         **({"dev_code": code} if DEV_MODE else {}),
     }
 
@@ -240,6 +256,37 @@ async def verify_email(request: VerifyRequest):
     entry["verified"] = True
     return {"ok": True, "message": "Email verified"}
 
+
+async def _send_verification_email(email: str, code: str) -> bool:
+    subject = "Your verification code"
+    text = f"Your verification code is {code}. It expires in 10 minutes."
+    if RESEND_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+                    json={"from": SMTP_FROM or "noreply@example.com", "to": [email], "subject": subject, "text": text},
+                )
+                if r.status_code in (200, 201, 202):
+                    return True
+        except Exception:
+            pass
+    if SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM:
+        try:
+            msg = EmailMessage()
+            msg["From"] = SMTP_FROM
+            msg["To"] = email
+            msg["Subject"] = subject
+            msg.set_content(text)
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+                s.starttls()
+                s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+            return True
+        except Exception:
+            return False
+    return False
 
 # =============================================================================
 # REVIEW ENDPOINT (new)
