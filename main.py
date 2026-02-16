@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
+from fastapi.responses import JSONResponse
 
 # Load .env from backend folder or project root
 env_path = Path(__file__).parent / ".env"
@@ -128,6 +129,51 @@ Be concise and practical. If the user shares code, analyze it and give actionabl
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# =============================================================================
+# AUTH ENDPOINTS (minimal stubs for frontend compatibility)
+# =============================================================================
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    name: str | None = None
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/signup")
+@app.post("/signup")
+async def signup(request: SignupRequest):
+    email = (request.email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    name = (request.name or email.split("@")[0]).strip()
+    return JSONResponse(
+        {
+            "ok": True,
+            "message": "Account created",
+            "user": {"email": email, "name": name, "id": f"user_{abs(hash(email))%10_000_000}"},
+            "token": "demo-token",
+        }
+    )
+
+
+@app.post("/api/login")
+@app.post("/login")
+async def login(request: LoginRequest):
+    email = (request.email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    return {
+        "ok": True,
+        "message": "Signed in",
+        "user": {"email": email, "name": email.split("@")[0], "id": f"user_{abs(hash(email))%10_000_000}"},
+        "token": "demo-token",
+    }
 
 
 # =============================================================================
