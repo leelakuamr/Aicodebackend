@@ -12,13 +12,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
-from fastapi.responses import JSONResponse
-from datetime import datetime, timedelta
-import secrets
-import smtplib
-from email.message import EmailMessage
-import logging
-from typing import Tuple
 
 # Load .env from backend folder or project root
 env_path = Path(__file__).parent / ".env"
@@ -32,14 +25,6 @@ load_dotenv(env_path)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "llama-3.3-70b-versatile"
-DEV_MODE = os.getenv("DEV_MODE", "false").lower() in {"1", "true", "yes"}
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:8080")
 
 app = FastAPI(title="AI Code Review API")
 
@@ -55,19 +40,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-logger = logging.getLogger("aicode.mail")
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
-
-@app.on_event("startup")
-async def _log_email_provider():
-    provider = (
-        "resend"
-        if RESEND_API_KEY
-        else ("smtp" if (SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM) else "none")
-    )
-    logger.info("Email provider: %s", provider)
 
 
 # =============================================================================
@@ -157,179 +129,6 @@ Be concise and practical. If the user shares code, analyze it and give actionabl
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-
-# =============================================================================
-# AUTH ENDPOINTS (minimal stubs for frontend compatibility)
-# =============================================================================
-class SignupRequest(BaseModel):
-    email: str
-    password: str
-    name: str | None = None
-
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-
-class SendCodeRequest(BaseModel):
-    email: str
-
-
-class VerifyRequest(BaseModel):
-    email: str
-    code: str
-
-
-VERIFICATION_STORE: dict[str, dict] = {}
-TOKEN_STORE: dict[str, dict] = {}
-
-def _gen_code() -> str:
-    return f"{secrets.randbelow(1_000_000):06d}"
-
-def _gen_token() -> str:
-    return secrets.token_urlsafe(32)
-
-
-@app.post("/api/signup")
-@app.post("/signup")
-async def signup(request: SignupRequest):
-    email = (request.email or "").strip()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Valid email is required")
-    name = (request.name or email.split("@")[0]).strip()
-    code = _gen_code()
-    VERIFICATION_STORE[email.lower()] = {
-        "code": code,
-        "expires": datetime.utcnow() + timedelta(minutes=10),
-        "attempts": 0,
-        "verified": False,
-    }
-    token = _gen_token()
-    TOKEN_STORE[token] = {"email": email.lower(), "expires": datetime.utcnow() + timedelta(hours=6)}
-    link = f"{FRONTEND_BASE_URL.rstrip('/')}/?mode=verifyEmail&vtoken={token}"
-    sent, provider, err = await _send_email(email, "Verify your email", f"Click to verify: {link}")
-    return JSONResponse(
-        {
-            "ok": True,
-            "message": "Account created",
-            "user": {"email": email, "name": name, "id": f"user_{abs(hash(email))%10_000_000}"},
-            "token": "demo-token",
-            "verification": {
-                "sent": True,
-                "email_sent": bool(sent),
-                **({"email_provider": provider, "email_error": err} if DEV_MODE and not sent else {}),
-                "method": "link",
-            },
-        }
-    )
-
-
-@app.post("/api/login")
-@app.post("/login")
-async def login(request: LoginRequest):
-    email = (request.email or "").strip()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Valid email is required")
-    entry = VERIFICATION_STORE.get(email.lower())
-    if entry and not entry.get("verified"):
-        raise HTTPException(status_code=403, detail="Please verify your email to sign in")
-    return {
-        "ok": True,
-        "message": "Signed in",
-        "user": {"email": email, "name": email.split("@")[0], "id": f"user_{abs(hash(email))%10_000_000}"},
-        "token": "demo-token",
-    }
-
-
-@app.post("/api/send-code")
-@app.post("/api/resend-code")
-async def send_code(request: SendCodeRequest):
-    email = (request.email or "").strip()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Valid email is required")
-    token = _gen_token()
-    TOKEN_STORE[token] = {"email": email.lower(), "expires": datetime.utcnow() + timedelta(hours=6)}
-    if email.lower() not in VERIFICATION_STORE:
-        VERIFICATION_STORE[email.lower()] = {"verified": False}
-    link = f"{FRONTEND_BASE_URL.rstrip('/')}/?mode=verifyEmail&vtoken={token}"
-    sent, provider, err = await _send_email(email, "Verify your email", f"Click to verify: {link}")
-    return {
-        "ok": True,
-        "message": "Verification link sent",
-        "email_sent": bool(sent),
-        **({"email_provider": provider, "email_error": err} if DEV_MODE and not sent else {}),
-    }
-
-
-@app.post("/api/verify-email")
-@app.post("/api/verify")
-async def verify_email(request: VerifyRequest):
-    email = (request.email or "").strip().lower()
-    code = (request.code or "").strip()
-    if not email or "@" not in email or not code:
-        raise HTTPException(status_code=400, detail="Email and code are required")
-    entry = VERIFICATION_STORE.get(email)
-    if not entry:
-        raise HTTPException(status_code=404, detail="No code sent")
-    if entry.get("expires") and datetime.utcnow() > entry["expires"]:
-        raise HTTPException(status_code=400, detail="Code expired")
-    entry["attempts"] = entry.get("attempts", 0) + 1
-    if entry["code"] != code:
-        raise HTTPException(status_code=400, detail="Invalid code")
-    entry["verified"] = True
-    return {"ok": True, "message": "Email verified"}
-
-class VerifyTokenRequest(BaseModel):
-    token: str
-
-@app.post("/api/verify-link")
-async def verify_link(request: VerifyTokenRequest):
-    token = (request.token or "").strip()
-    info = TOKEN_STORE.get(token)
-    if not token or not info:
-        raise HTTPException(status_code=400, detail="Invalid or expired token")
-    if datetime.utcnow() > info["expires"]:
-        TOKEN_STORE.pop(token, None)
-        raise HTTPException(status_code=400, detail="Verification link expired")
-    email = info["email"]
-    entry = VERIFICATION_STORE.get(email) or {}
-    entry["verified"] = True
-    VERIFICATION_STORE[email] = entry
-    TOKEN_STORE.pop(token, None)
-    return {"ok": True, "message": "Email verified"}
-
-async def _send_email(email: str, subject: str, text: str) -> Tuple[bool, str, str]:
-    if RESEND_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.post(
-                    "https://api.resend.com/emails",
-                    headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-                    json={"from": SMTP_FROM or "noreply@example.com", "to": [email], "subject": subject, "text": text},
-                )
-                if r.status_code in (200, 201, 202):
-                    return True, "resend", ""
-                return False, "resend", f"status={r.status_code} body={r.text[:200]}"
-        except Exception as e:
-            logger.warning("Resend email send failed: %s", e)
-            return False, "resend", str(e)
-    if SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM:
-        try:
-            msg = EmailMessage()
-            msg["From"] = SMTP_FROM
-            msg["To"] = email
-            msg["Subject"] = subject
-            msg.set_content(text)
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-                s.starttls()
-                s.login(SMTP_USER, SMTP_PASS)
-                s.send_message(msg)
-            return True, "smtp", ""
-        except Exception as e:
-            logger.warning("SMTP send failed: %s", e)
-            return False, "smtp", str(e)
-    return False, "none", "no provider configured"
 
 # =============================================================================
 # REVIEW ENDPOINT (new)
