@@ -185,7 +185,7 @@ async def signup(request: SignupRequest):
         "attempts": 0,
         "verified": False,
     }
-    sent = await _send_verification_email(email, code)
+    sent, provider, err = await _send_verification_email(email, code)
     return JSONResponse(
         {
             "ok": True,
@@ -195,6 +195,7 @@ async def signup(request: SignupRequest):
             "verification": {
                 "sent": True,
                 "email_sent": bool(sent),
+                **({"email_provider": provider, "email_error": err} if DEV_MODE and not sent else {}),
                 "method": "code",
                 **({"dev_code": code} if DEV_MODE else {}),
             },
@@ -229,11 +230,12 @@ async def send_code(request: SendCodeRequest):
         "attempts": 0,
         "verified": False,
     }
-    sent = await _send_verification_email(email, code)
+    sent, provider, err = await _send_verification_email(email, code)
     return {
         "ok": True,
         "message": "Verification code sent",
         "email_sent": bool(sent),
+        **({"email_provider": provider, "email_error": err} if DEV_MODE and not sent else {}),
         **({"dev_code": code} if DEV_MODE else {}),
     }
 
@@ -257,7 +259,7 @@ async def verify_email(request: VerifyRequest):
     return {"ok": True, "message": "Email verified"}
 
 
-async def _send_verification_email(email: str, code: str) -> bool:
+async def _send_verification_email(email: str, code: str) -> tuple[bool, str, str]:
     subject = "Your verification code"
     text = f"Your verification code is {code}. It expires in 10 minutes."
     if RESEND_API_KEY:
@@ -269,9 +271,10 @@ async def _send_verification_email(email: str, code: str) -> bool:
                     json={"from": SMTP_FROM or "noreply@example.com", "to": [email], "subject": subject, "text": text},
                 )
                 if r.status_code in (200, 201, 202):
-                    return True
+                    return True, "resend", ""
+                return False, "resend", f"status={r.status_code} body={r.text[:200]}"
         except Exception:
-            pass
+            return False, "resend", str(e)
     if SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM:
         try:
             msg = EmailMessage()
@@ -283,10 +286,10 @@ async def _send_verification_email(email: str, code: str) -> bool:
                 s.starttls()
                 s.login(SMTP_USER, SMTP_PASS)
                 s.send_message(msg)
-            return True
-        except Exception:
-            return False
-    return False
+            return True, "smtp", ""
+        except Exception as e:
+            return False, "smtp", str(e)
+    return False, "none", "no provider configured"
 
 # =============================================================================
 # REVIEW ENDPOINT (new)
