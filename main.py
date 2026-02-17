@@ -139,26 +139,35 @@ class ReviewRequest(BaseModel):
     focus_areas: list[str] | None = None  # optional, for backward compat
 
 
-REVIEW_SYSTEM_PROMPT = """You are an expert code reviewer and security analyst. Analyze the given code thoroughly.
+REVIEW_SYSTEM_PROMPT = """You are an expert code reviewer and security analyst.
 
-You MUST respond with ONLY a valid JSON object, no markdown, no code blocks, no extra text. Use this exact structure:
+Analyze the given code thoroughly.
+
+You MUST respond with ONLY a valid JSON object using this exact structure:
 
 {
-  "summary": "2-4 sentence overall assessment of the code quality",
-  "critical_issues": ["issue1", "issue2"],
-  "security_issues": ["security1", "security2"],
-  "performance_improvements": ["improvement1", "improvement2"],
-  "best_practices": ["practice1", "practice2"],
+  "summary": "2-4 sentence overall assessment",
+  "critical_issues": [
+    {"line": 4, "message": "Null pointer risk"},
+    {"line": 10, "message": "Division by zero possible"}
+  ],
+  "security_issues": [
+    {"line": 15, "message": "SQL Injection vulnerability"}
+  ],
+  "performance_improvements": [
+    {"line": 22, "message": "Inefficient loop"}
+  ],
+  "best_practices": [
+    {"line": 3, "message": "Missing input validation"}
+  ],
   "score": 85
 }
 
 Rules:
-- score: integer 0-100 (code quality)
-- Each array: list of strings, 0-5 items each. Be specific and actionable.
-- Check for: bugs, security vulnerabilities (injection, XSS, hardcoded secrets, weak crypto), performance bottlenecks, memory leaks, error handling gaps, input validation, code style, maintainability.
-- If no issues in a category, use empty array [].
-- Output ONLY the JSON object, nothing else."""
-
+- line must be actual line number from the code.
+- message must be short and actionable.
+- If no issues in category use [].
+- Output ONLY JSON."""
 
 def _parse_review_json(raw: str) -> dict:
     """Parse LLM response to structured review. Handles markdown fences."""
@@ -202,38 +211,52 @@ def _review_to_backward_compat(data: dict) -> dict:
 @app.post("/api/review")
 @app.post("/review")
 async def review(request: ReviewRequest):
-    """Review code for quality, security, performance, best practices."""
     code = (request.code or "").strip()
     if not code:
         raise HTTPException(status_code=400, detail="Code is required")
 
-    user_content = f"Review this {request.language} code:\n```{request.language}\n{code}\n```"
+    user_content = f"Review this {request.language} code with line numbers:\n```{request.language}\n{code}\n```"
+
     try:
         content = await _call_groq(
             [
                 {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=2048,
         )
+
         data = _parse_review_json(content)
-        result = {
+
+        # 🔥 Collect all errors into single list
+        all_errors = []
+
+        for category in [
+            "critical_issues",
+            "security_issues",
+            "performance_improvements",
+            "best_practices",
+        ]:
+            for item in data.get(category, []):
+                if isinstance(item, dict) and "line" in item:
+                    all_errors.append({
+                        "line": item["line"],
+                        "message": item["message"]
+                    })
+
+        return {
             "summary": data.get("summary", ""),
             "critical_issues": data.get("critical_issues", []),
             "security_issues": data.get("security_issues", []),
             "performance_improvements": data.get("performance_improvements", []),
             "best_practices": data.get("best_practices", []),
-            "score": int(data.get("score", 0)) if data.get("score") is not None else 0,
+            "score": int(data.get("score", 0)),
+            "errors": all_errors  # 🔥 NEW FIELD FOR FRONTEND
         }
-        compat = _review_to_backward_compat(result)
-        result.update(compat)
-        return result
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"Failed to parse review response: {e}")
+
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
-
 
 # =============================================================================
 # REWRITE ENDPOINT (new)
