@@ -139,35 +139,42 @@ class ReviewRequest(BaseModel):
     focus_areas: list[str] | None = None  # optional, for backward compat
 
 
-REVIEW_SYSTEM_PROMPT = """You are an expert code reviewer and security analyst.
+REVIEW_SYSTEM_PROMPT = """You are a strict code reviewer and static analyzer.
+You receive:
+- `code`: the full source code as a string
+- `language`: the programming language name (e.g. "python", "javascript", "java")
+- `focus_areas`: optional list like ["bugs","performance","security","best-practices"]
 
-Analyze the given code thoroughly.
-
-You MUST respond with ONLY a valid JSON object using this exact structure:
-
+Your job:
+1. Carefully analyze the code.
+2. Find all real or highly likely issues.
+3. For each issue, record the exact 1-based line number.
+4. Return a JSON object ONLY, with this shape:
 {
-  "summary": "2-4 sentence overall assessment",
-  "critical_issues": [
-    {"line": 4, "message": "Null pointer risk"},
-    {"line": 10, "message": "Division by zero possible"}
+  "review": "Markdown text with sections like ## Critical Issues, ## High Priority, ## Medium, ## Low. Explain problems and suggest fixes.",
+  "line_errors": {
+    "<line_number_as_string>": [
+      "Short clear message for this line",
+      "Another message if needed"
+    ]
+  },
+  "keyImprovements": [
+    { "title": "Short title", "description": "1–2 sentence explanation" }
   ],
-  "security_issues": [
-    {"line": 15, "message": "SQL Injection vulnerability"}
-  ],
-  "performance_improvements": [
-    {"line": 22, "message": "Inefficient loop"}
-  ],
-  "best_practices": [
-    {"line": 3, "message": "Missing input validation"}
-  ],
-  "score": 85
+  "explanation": "Short paragraph summarizing what you changed or would change.",
+  "scores": {
+    "performance": 0,
+    "security": 0,
+    "bestPractices": 0
+  }
 }
 
 Rules:
-- line must be actual line number from the code.
-- message must be short and actionable.
-- If no issues in category use [].
-- Output ONLY JSON."""
+- line_numbers must be 1-based and match the given code exactly.
+- If there are no issues on a line, do not include that line in line_errors.
+- If no issues at all, return an empty object for line_errors: {}.
+- ALWAYS return valid JSON.
+- Do NOT include backticks, markdown fences, or commentary outside the JSON."""
 
 def _parse_review_json(raw: str) -> dict:
     """Parse LLM response to structured review. Handles markdown fences."""
@@ -179,6 +186,45 @@ def _parse_review_json(raw: str) -> dict:
         else:
             txt = txt.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
     return json.loads(txt)
+
+
+def _clamp_score(value, default: int = 0) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = default
+    return max(0, min(100, v))
+
+
+def _normalize_line_errors(line_errors) -> dict[str, list[str]]:
+    if not isinstance(line_errors, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for k, v in line_errors.items():
+        key = str(k).strip()
+        if not key or not key.isdigit():
+            continue
+        if isinstance(v, list):
+            msgs = [str(x) for x in v if str(x).strip()]
+        else:
+            msgs = [str(v)] if str(v).strip() else []
+        if msgs:
+            out[key] = msgs
+    return out
+
+
+def _normalize_key_improvements(items) -> list[dict]:
+    if not isinstance(items, list):
+        return []
+    out: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title", "")).strip()
+        desc = str(it.get("description", "")).strip()
+        if title or desc:
+            out.append({"title": title or "Improvement", "description": desc})
+    return out
 
 
 def _review_to_backward_compat(data: dict) -> dict:
@@ -248,7 +294,12 @@ async def review(request: ReviewRequest):
         raise HTTPException(status_code=400, detail="Code is required")
 
     language = _normalize_language(request.language)
-    user_content = f"Review this {language} code with line numbers:\n```{language}\n{code}\n```"
+    focus_areas = request.focus_areas if isinstance(request.focus_areas, list) else []
+    user_content = (
+        f"code:<<<{code}>>>\n"
+        f"language: {language}\n"
+        f"focus_areas: {json.dumps(focus_areas)}"
+    )
 
     try:
         content = await _call_groq(
@@ -262,40 +313,40 @@ async def review(request: ReviewRequest):
 
         data = _parse_review_json(content)
 
-        # 🔥 Collect all errors into a single list and also group by line
-        all_errors: list[dict] = []
-        line_errors: dict[int, list[dict]] = {}
+        # If the model accidentally returns the older schema, adapt it.
+        if "review" not in data and "summary" in data:
+            compat = _review_to_backward_compat(data)
+            data = {
+                "review": compat.get("review", ""),
+                "line_errors": {},  # older schema didn't include it
+                "keyImprovements": compat.get("keyImprovements", []),
+                "explanation": compat.get("explanation", ""),
+                "scores": {
+                    "performance": _clamp_score(data.get("score", 0)),
+                    "security": _clamp_score(data.get("score", 0)),
+                    "bestPractices": _clamp_score(data.get("score", 0)),
+                },
+            }
 
-        for category in [
-            "critical_issues",
-            "security_issues",
-            "performance_improvements",
-            "best_practices",
-        ]:
-            for item in data.get(category, []):
-                if isinstance(item, dict) and "line" in item and "message" in item:
-                    err = {
-                        "line": int(item["line"]),
-                        "message": item["message"],
-                        "category": category,
-                    }
-                    all_errors.append(err)
-                    line_errors.setdefault(int(item["line"]), []).append(err)
-
-        # Shape that is easy for frontend to highlight lines in red
-        line_errors_compact = {
-            str(line): [e["message"] for e in errs] for line, errs in line_errors.items()
+        review_md = str(data.get("review", "") or "")
+        line_errors_norm = _normalize_line_errors(data.get("line_errors", {}))
+        key_improvements_norm = _normalize_key_improvements(
+            data.get("keyImprovements", data.get("key_improvements", []))
+        )
+        explanation = str(data.get("explanation", "") or "")
+        scores_in = data.get("scores", {}) if isinstance(data.get("scores", {}), dict) else {}
+        scores = {
+            "performance": _clamp_score(scores_in.get("performance", 0)),
+            "security": _clamp_score(scores_in.get("security", 0)),
+            "bestPractices": _clamp_score(scores_in.get("bestPractices", 0)),
         }
 
         return {
-            "summary": data.get("summary", ""),
-            "critical_issues": data.get("critical_issues", []),
-            "security_issues": data.get("security_issues", []),
-            "performance_improvements": data.get("performance_improvements", []),
-            "best_practices": data.get("best_practices", []),
-            "score": int(data.get("score", 0)),
-            "errors": all_errors,  # full objects with line/message/category
-            "line_errors": line_errors_compact,  # { "3": ["msg1", "msg2"], ... }
+            "review": review_md,
+            "line_errors": line_errors_norm,
+            "keyImprovements": key_improvements_norm,
+            "explanation": explanation,
+            "scores": scores,
         }
 
     except Exception as e:
