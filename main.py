@@ -12,6 +12,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
+from fastapi.responses import JSONResponse
+from datetime import datetime, timedelta
+import secrets
 
 # Load .env from backend folder or project root
 env_path = Path(__file__).parent / ".env"
@@ -25,6 +28,7 @@ load_dotenv(env_path)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "llama-3.3-70b-versatile"
+DEV_MODE = os.getenv("DEV_MODE", "false").lower() in {"1", "true", "yes"}
 
 app = FastAPI(title="AI Code Review API")
 
@@ -131,6 +135,113 @@ Be concise and practical. If the user shares code, analyze it and give actionabl
 
 
 # =============================================================================
+# AUTH ENDPOINTS (minimal stubs for frontend compatibility)
+# =============================================================================
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    name: str | None = None
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class SendCodeRequest(BaseModel):
+    email: str
+
+
+class VerifyRequest(BaseModel):
+    email: str
+    code: str
+
+
+VERIFICATION_STORE: dict[str, dict] = {}
+
+def _gen_code() -> str:
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+@app.post("/api/signup")
+@app.post("/signup")
+async def signup(request: SignupRequest):
+    email = (request.email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    name = (request.name or email.split("@")[0]).strip()
+    code = _gen_code()
+    VERIFICATION_STORE[email.lower()] = {
+        "code": code,
+        "expires": datetime.utcnow() + timedelta(minutes=10),
+        "attempts": 0,
+        "verified": False,
+    }
+    return JSONResponse(
+        {
+            "ok": True,
+            "message": "Account created",
+            "user": {"email": email, "name": name, "id": f"user_{abs(hash(email))%10_000_000}"},
+            "token": "demo-token",
+            "verification": {"sent": True, "method": "code", **({"dev_code": code} if DEV_MODE else {})},
+        }
+    )
+
+
+@app.post("/api/login")
+@app.post("/login")
+async def login(request: LoginRequest):
+    email = (request.email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    return {
+        "ok": True,
+        "message": "Signed in",
+        "user": {"email": email, "name": email.split("@")[0], "id": f"user_{abs(hash(email))%10_000_000}"},
+        "token": "demo-token",
+    }
+
+
+@app.post("/api/send-code")
+@app.post("/api/resend-code")
+async def send_code(request: SendCodeRequest):
+    email = (request.email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    code = _gen_code()
+    VERIFICATION_STORE[email.lower()] = {
+        "code": code,
+        "expires": datetime.utcnow() + timedelta(minutes=10),
+        "attempts": 0,
+        "verified": False,
+    }
+    return {
+        "ok": True,
+        "message": "Verification code sent",
+        **({"dev_code": code} if DEV_MODE else {}),
+    }
+
+
+@app.post("/api/verify-email")
+@app.post("/api/verify")
+async def verify_email(request: VerifyRequest):
+    email = (request.email or "").strip().lower()
+    code = (request.code or "").strip()
+    if not email or "@" not in email or not code:
+        raise HTTPException(status_code=400, detail="Email and code are required")
+    entry = VERIFICATION_STORE.get(email)
+    if not entry:
+        raise HTTPException(status_code=404, detail="No code sent")
+    if entry.get("expires") and datetime.utcnow() > entry["expires"]:
+        raise HTTPException(status_code=400, detail="Code expired")
+    entry["attempts"] = entry.get("attempts", 0) + 1
+    if entry["code"] != code:
+        raise HTTPException(status_code=400, detail="Invalid code")
+    entry["verified"] = True
+    return {"ok": True, "message": "Email verified"}
+
+
+# =============================================================================
 # REVIEW ENDPOINT (new)
 # =============================================================================
 class ReviewRequest(BaseModel):
@@ -139,42 +250,26 @@ class ReviewRequest(BaseModel):
     focus_areas: list[str] | None = None  # optional, for backward compat
 
 
-REVIEW_SYSTEM_PROMPT = """You are a strict code reviewer and static analyzer.
-You receive:
-- `code`: the full source code as a string
-- `language`: the programming language name (e.g. "python", "javascript", "java")
-- `focus_areas`: optional list like ["bugs","performance","security","best-practices"]
+REVIEW_SYSTEM_PROMPT = """You are an expert code reviewer and security analyst. Analyze the given code thoroughly.
 
-Your job:
-1. Carefully analyze the code.
-2. Find all real or highly likely issues.
-3. For each issue, record the exact 1-based line number.
-4. Return a JSON object ONLY, with this shape:
+You MUST respond with ONLY a valid JSON object, no markdown, no code blocks, no extra text. Use this exact structure:
+
 {
-  "review": "Markdown text with sections like ## Critical Issues, ## High Priority, ## Medium, ## Low. Explain problems and suggest fixes.",
-  "line_errors": {
-    "<line_number_as_string>": [
-      "Short clear message for this line",
-      "Another message if needed"
-    ]
-  },
-  "keyImprovements": [
-    { "title": "Short title", "description": "1–2 sentence explanation" }
-  ],
-  "explanation": "Short paragraph summarizing what you changed or would change.",
-  "scores": {
-    "performance": 0,
-    "security": 0,
-    "bestPractices": 0
-  }
+  "summary": "2-4 sentence overall assessment of the code quality",
+  "critical_issues": ["issue1", "issue2"],
+  "security_issues": ["security1", "security2"],
+  "performance_improvements": ["improvement1", "improvement2"],
+  "best_practices": ["practice1", "practice2"],
+  "score": 85
 }
 
 Rules:
-- line_numbers must be 1-based and match the given code exactly.
-- If there are no issues on a line, do not include that line in line_errors.
-- If no issues at all, return an empty object for line_errors: {}.
-- ALWAYS return valid JSON.
-- Do NOT include backticks, markdown fences, or commentary outside the JSON."""
+- score: integer 0-100 (code quality)
+- Each array: list of strings, 0-5 items each. Be specific and actionable.
+- Check for: bugs, security vulnerabilities (injection, XSS, hardcoded secrets, weak crypto), performance bottlenecks, memory leaks, error handling gaps, input validation, code style, maintainability.
+- If no issues in a category, use empty array [].
+- Output ONLY the JSON object, nothing else."""
+
 
 def _parse_review_json(raw: str) -> dict:
     """Parse LLM response to structured review. Handles markdown fences."""
@@ -188,88 +283,17 @@ def _parse_review_json(raw: str) -> dict:
     return json.loads(txt)
 
 
-def _clamp_score(value, default: int = 0) -> int:
-    try:
-        v = int(value)
-    except (TypeError, ValueError):
-        v = default
-    return max(0, min(100, v))
-
-
-def _normalize_line_errors(line_errors) -> dict[str, list[str]]:
-    if not isinstance(line_errors, dict):
-        return {}
-    out: dict[str, list[str]] = {}
-    for k, v in line_errors.items():
-        key = str(k).strip()
-        if not key or not key.isdigit():
-            continue
-        if isinstance(v, list):
-            msgs = [str(x) for x in v if str(x).strip()]
-        else:
-            msgs = [str(v)] if str(v).strip() else []
-        if msgs:
-            out[key] = msgs
-    return out
-
-
-def _normalize_key_improvements(items) -> list[dict]:
-    if not isinstance(items, list):
-        return []
-    out: list[dict] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        title = str(it.get("title", "")).strip()
-        desc = str(it.get("description", "")).strip()
-        if title or desc:
-            out.append({"title": title or "Improvement", "description": desc})
-    return out
-
-
 def _review_to_backward_compat(data: dict) -> dict:
     """Build review, keyImprovements, explanation for existing frontend."""
     parts = []
     if data.get("critical_issues"):
-        parts.append(
-            "## Critical Issues\n"
-            + "\n".join(
-                f"- Line {item.get('line')}: {item.get('message')}"
-                if isinstance(item, dict)
-                else f"- {item}"
-                for item in data["critical_issues"]
-            )
-        )
+        parts.append("## Critical Issues\n" + "\n".join(f"- {x}" for x in data["critical_issues"]))
     if data.get("security_issues"):
-        parts.append(
-            "## Security Issues\n"
-            + "\n".join(
-                f"- Line {item.get('line')}: {item.get('message')}"
-                if isinstance(item, dict)
-                else f"- {item}"
-                for item in data["security_issues"]
-            )
-        )
+        parts.append("## Security Issues\n" + "\n".join(f"- {x}" for x in data["security_issues"]))
     if data.get("performance_improvements"):
-        parts.append(
-            "## Performance\n"
-            + "\n".join(
-                f"- Line {item.get('line')}: {item.get('message')}"
-                if isinstance(item, dict)
-                else f"- {item}"
-                for item in data["performance_improvements"]
-            )
-        )
+        parts.append("## Performance\n" + "\n".join(f"- {x}" for x in data["performance_improvements"]))
     if data.get("best_practices"):
-        parts.append(
-            "## Best Practices\n"
-            + "\n".join(
-                f"- Line {item.get('line')}: {item.get('message')}"
-                if isinstance(item, dict)
-                else f"- {item}"
-                for item in data["best_practices"]
-            )
-        )
+        parts.append("## Best Practices\n" + "\n".join(f"- {x}" for x in data["best_practices"]))
     parts.append("## Summary\n" + (data.get("summary") or ""))
     review_md = "\n\n".join(parts)
     improvements = [
@@ -289,68 +313,38 @@ def _review_to_backward_compat(data: dict) -> dict:
 @app.post("/api/review")
 @app.post("/review")
 async def review(request: ReviewRequest):
+    """Review code for quality, security, performance, best practices."""
     code = (request.code or "").strip()
     if not code:
         raise HTTPException(status_code=400, detail="Code is required")
 
-    language = _normalize_language(request.language)
-    focus_areas = request.focus_areas if isinstance(request.focus_areas, list) else []
-    user_content = (
-        f"code:<<<{code}>>>\n"
-        f"language: {language}\n"
-        f"focus_areas: {json.dumps(focus_areas)}"
-    )
-
+    user_content = f"Review this {request.language} code:\n```{request.language}\n{code}\n```"
     try:
         content = await _call_groq(
             [
                 {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            temperature=0.2,
+            temperature=0.3,
             max_tokens=2048,
         )
-
         data = _parse_review_json(content)
-
-        # If the model accidentally returns the older schema, adapt it.
-        if "review" not in data and "summary" in data:
-            compat = _review_to_backward_compat(data)
-            data = {
-                "review": compat.get("review", ""),
-                "line_errors": {},  # older schema didn't include it
-                "keyImprovements": compat.get("keyImprovements", []),
-                "explanation": compat.get("explanation", ""),
-                "scores": {
-                    "performance": _clamp_score(data.get("score", 0)),
-                    "security": _clamp_score(data.get("score", 0)),
-                    "bestPractices": _clamp_score(data.get("score", 0)),
-                },
-            }
-
-        review_md = str(data.get("review", "") or "")
-        line_errors_norm = _normalize_line_errors(data.get("line_errors", {}))
-        key_improvements_norm = _normalize_key_improvements(
-            data.get("keyImprovements", data.get("key_improvements", []))
-        )
-        explanation = str(data.get("explanation", "") or "")
-        scores_in = data.get("scores", {}) if isinstance(data.get("scores", {}), dict) else {}
-        scores = {
-            "performance": _clamp_score(scores_in.get("performance", 0)),
-            "security": _clamp_score(scores_in.get("security", 0)),
-            "bestPractices": _clamp_score(scores_in.get("bestPractices", 0)),
+        result = {
+            "summary": data.get("summary", ""),
+            "critical_issues": data.get("critical_issues", []),
+            "security_issues": data.get("security_issues", []),
+            "performance_improvements": data.get("performance_improvements", []),
+            "best_practices": data.get("best_practices", []),
+            "score": int(data.get("score", 0)) if data.get("score") is not None else 0,
         }
-
-        return {
-            "review": review_md,
-            "line_errors": line_errors_norm,
-            "keyImprovements": key_improvements_norm,
-            "explanation": explanation,
-            "scores": scores,
-        }
-
+        compat = _review_to_backward_compat(result)
+        result.update(compat)
+        return result
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to parse review response: {e}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
 
 # =============================================================================
 # REWRITE ENDPOINT (new)
@@ -371,59 +365,6 @@ Rules:
 - Preserve exact functionality. Fix typos, improve style, add error handling if missing.
 - Follow best practices for the given language.
 - Output ONLY the JSON object, nothing before or after."""
-
-
-def _normalize_language(language: str) -> str:
-    lang = (language or "").strip().lower()
-    aliases = {
-        "js": "javascript",
-        "ts": "typescript",
-        "py": "python",
-        "c++": "cpp",
-        "c#": "csharp",
-        "golang": "go",
-    }
-    return aliases.get(lang, lang or "plaintext")
-
-
-def _looks_like_language(code: str, language: str) -> bool:
-    """
-    Very lightweight heuristic to detect obvious language mismatches.
-    This is intentionally conservative: if unsure, return True.
-    """
-    lang = _normalize_language(language)
-    txt = (code or "").strip()
-    if not txt:
-        return True
-
-    # Markup/data languages
-    if lang in {"html", "xml", "svg"}:
-        return "<" in txt and ">" in txt
-    if lang in {"css", "scss", "sass", "less"}:
-        return "{" in txt and "}" in txt and ":" in txt
-    if lang == "json":
-        return txt[0] in "{[" and txt[-1] in "}]"
-    if lang in {"yaml", "yml"}:
-        return "\n" in txt and (":" in txt)
-
-    # Common programming languages (spot-check)
-    lowered = txt.lower()
-    if lang == "python":
-        return bool(re.search(r"^\s*(def |class |import |from )", txt, flags=re.M))
-    if lang in {"javascript", "typescript"}:
-        return any(k in lowered for k in ("function", "const ", "let ", "var ", "=>", "export ", "import "))
-    if lang in {"java", "kotlin"}:
-        return any(k in lowered for k in ("class ", "public ", "private ", "package ", "import "))
-    if lang in {"c", "cpp", "csharp"}:
-        return any(k in lowered for k in ("#include", "using ", "namespace", "class ", "int main", "public "))
-    if lang == "go":
-        return any(k in lowered for k in ("package ", "func ", "import "))
-    if lang == "rust":
-        return any(k in lowered for k in ("fn ", "use ", "mod ", "crate"))
-
-    # Unknown language: don't block.
-    return True
-
 
 
 def _strip_code_fence(text: str) -> str:
@@ -477,34 +418,17 @@ async def rewrite(request: RewriteRequest):
     if not code:
         raise HTTPException(status_code=400, detail="Code is required")
 
-    language = _normalize_language(request.language)
-    strict_lang_guard = (
-        "CRITICAL: You MUST keep the code in the SAME LANGUAGE as the input. "
-        "Do NOT translate it into another language. "
-        "If the input is HTML/CSS/JSON/XML, return valid optimized HTML/CSS/JSON/XML only."
-    )
-    user_content = (
-        f"{strict_lang_guard}\n\n"
-        f"Rewrite this {language} code:\n```{language}\n{code}\n```"
-    )
+    user_content = f"Rewrite this {request.language} code:\n```{request.language}\n{code}\n```"
     try:
         content = await _call_groq(
             [
-                {"role": "system", "content": REWRITE_SYSTEM_PROMPT + "\n\n" + strict_lang_guard},
+                {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            temperature=0.2,
+            temperature=0.3,
             max_tokens=2048,
         )
         opt, explanation = _extract_rewrite_response(content, code)
-        if not _looks_like_language(opt, language) and _looks_like_language(code, language):
-            # Model returned code in the wrong language (e.g., Python for HTML).
-            # Prefer returning the original code rather than misleading output.
-            opt = code
-            explanation = (
-                explanation
-                or "The model returned output in a different language than requested. Please retry."
-            )
         return {
             "optimized_code": opt,
             "explanation": explanation,
