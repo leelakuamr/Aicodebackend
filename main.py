@@ -13,8 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from fastapi.responses import JSONResponse
-from datetime import datetime, timedelta
-import secrets
 
 # Load .env from backend folder or project root
 env_path = Path(__file__).parent / ".env"
@@ -28,7 +26,6 @@ load_dotenv(env_path)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "llama-3.3-70b-versatile"
-DEV_MODE = os.getenv("DEV_MODE", "false").lower() in {"1", "true", "yes"}
 
 app = FastAPI(title="AI Code Review API")
 
@@ -148,21 +145,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class SendCodeRequest(BaseModel):
-    email: str
-
-
-class VerifyRequest(BaseModel):
-    email: str
-    code: str
-
-
-VERIFICATION_STORE: dict[str, dict] = {}
-
-def _gen_code() -> str:
-    return f"{secrets.randbelow(1_000_000):06d}"
-
-
 @app.post("/api/signup")
 @app.post("/signup")
 async def signup(request: SignupRequest):
@@ -170,20 +152,12 @@ async def signup(request: SignupRequest):
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Valid email is required")
     name = (request.name or email.split("@")[0]).strip()
-    code = _gen_code()
-    VERIFICATION_STORE[email.lower()] = {
-        "code": code,
-        "expires": datetime.utcnow() + timedelta(minutes=10),
-        "attempts": 0,
-        "verified": False,
-    }
     return JSONResponse(
         {
             "ok": True,
             "message": "Account created",
             "user": {"email": email, "name": name, "id": f"user_{abs(hash(email))%10_000_000}"},
             "token": "demo-token",
-            "verification": {"sent": True, "method": "code", **({"dev_code": code} if DEV_MODE else {})},
         }
     )
 
@@ -200,45 +174,6 @@ async def login(request: LoginRequest):
         "user": {"email": email, "name": email.split("@")[0], "id": f"user_{abs(hash(email))%10_000_000}"},
         "token": "demo-token",
     }
-
-
-@app.post("/api/send-code")
-@app.post("/api/resend-code")
-async def send_code(request: SendCodeRequest):
-    email = (request.email or "").strip()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Valid email is required")
-    code = _gen_code()
-    VERIFICATION_STORE[email.lower()] = {
-        "code": code,
-        "expires": datetime.utcnow() + timedelta(minutes=10),
-        "attempts": 0,
-        "verified": False,
-    }
-    return {
-        "ok": True,
-        "message": "Verification code sent",
-        **({"dev_code": code} if DEV_MODE else {}),
-    }
-
-
-@app.post("/api/verify-email")
-@app.post("/api/verify")
-async def verify_email(request: VerifyRequest):
-    email = (request.email or "").strip().lower()
-    code = (request.code or "").strip()
-    if not email or "@" not in email or not code:
-        raise HTTPException(status_code=400, detail="Email and code are required")
-    entry = VERIFICATION_STORE.get(email)
-    if not entry:
-        raise HTTPException(status_code=404, detail="No code sent")
-    if entry.get("expires") and datetime.utcnow() > entry["expires"]:
-        raise HTTPException(status_code=400, detail="Code expired")
-    entry["attempts"] = entry.get("attempts", 0) + 1
-    if entry["code"] != code:
-        raise HTTPException(status_code=400, detail="Invalid code")
-    entry["verified"] = True
-    return {"ok": True, "message": "Email verified"}
 
 
 # =============================================================================
