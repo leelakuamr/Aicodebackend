@@ -185,13 +185,45 @@ def _review_to_backward_compat(data: dict) -> dict:
     """Build review, keyImprovements, explanation for existing frontend."""
     parts = []
     if data.get("critical_issues"):
-        parts.append("## Critical Issues\n" + "\n".join(f"- {x}" for x in data["critical_issues"]))
+        parts.append(
+            "## Critical Issues\n"
+            + "\n".join(
+                f"- Line {item.get('line')}: {item.get('message')}"
+                if isinstance(item, dict)
+                else f"- {item}"
+                for item in data["critical_issues"]
+            )
+        )
     if data.get("security_issues"):
-        parts.append("## Security Issues\n" + "\n".join(f"- {x}" for x in data["security_issues"]))
+        parts.append(
+            "## Security Issues\n"
+            + "\n".join(
+                f"- Line {item.get('line')}: {item.get('message')}"
+                if isinstance(item, dict)
+                else f"- {item}"
+                for item in data["security_issues"]
+            )
+        )
     if data.get("performance_improvements"):
-        parts.append("## Performance\n" + "\n".join(f"- {x}" for x in data["performance_improvements"]))
+        parts.append(
+            "## Performance\n"
+            + "\n".join(
+                f"- Line {item.get('line')}: {item.get('message')}"
+                if isinstance(item, dict)
+                else f"- {item}"
+                for item in data["performance_improvements"]
+            )
+        )
     if data.get("best_practices"):
-        parts.append("## Best Practices\n" + "\n".join(f"- {x}" for x in data["best_practices"]))
+        parts.append(
+            "## Best Practices\n"
+            + "\n".join(
+                f"- Line {item.get('line')}: {item.get('message')}"
+                if isinstance(item, dict)
+                else f"- {item}"
+                for item in data["best_practices"]
+            )
+        )
     parts.append("## Summary\n" + (data.get("summary") or ""))
     review_md = "\n\n".join(parts)
     improvements = [
@@ -215,7 +247,8 @@ async def review(request: ReviewRequest):
     if not code:
         raise HTTPException(status_code=400, detail="Code is required")
 
-    user_content = f"Review this {request.language} code with line numbers:\n```{request.language}\n{code}\n```"
+    language = _normalize_language(request.language)
+    user_content = f"Review this {language} code with line numbers:\n```{language}\n{code}\n```"
 
     try:
         content = await _call_groq(
@@ -229,8 +262,9 @@ async def review(request: ReviewRequest):
 
         data = _parse_review_json(content)
 
-        # 🔥 Collect all errors into single list
-        all_errors = []
+        # 🔥 Collect all errors into a single list and also group by line
+        all_errors: list[dict] = []
+        line_errors: dict[int, list[dict]] = {}
 
         for category in [
             "critical_issues",
@@ -239,11 +273,19 @@ async def review(request: ReviewRequest):
             "best_practices",
         ]:
             for item in data.get(category, []):
-                if isinstance(item, dict) and "line" in item:
-                    all_errors.append({
-                        "line": item["line"],
-                        "message": item["message"]
-                    })
+                if isinstance(item, dict) and "line" in item and "message" in item:
+                    err = {
+                        "line": int(item["line"]),
+                        "message": item["message"],
+                        "category": category,
+                    }
+                    all_errors.append(err)
+                    line_errors.setdefault(int(item["line"]), []).append(err)
+
+        # Shape that is easy for frontend to highlight lines in red
+        line_errors_compact = {
+            str(line): [e["message"] for e in errs] for line, errs in line_errors.items()
+        }
 
         return {
             "summary": data.get("summary", ""),
@@ -252,7 +294,8 @@ async def review(request: ReviewRequest):
             "performance_improvements": data.get("performance_improvements", []),
             "best_practices": data.get("best_practices", []),
             "score": int(data.get("score", 0)),
-            "errors": all_errors  # 🔥 NEW FIELD FOR FRONTEND
+            "errors": all_errors,  # full objects with line/message/category
+            "line_errors": line_errors_compact,  # { "3": ["msg1", "msg2"], ... }
         }
 
     except Exception as e:
@@ -277,6 +320,59 @@ Rules:
 - Preserve exact functionality. Fix typos, improve style, add error handling if missing.
 - Follow best practices for the given language.
 - Output ONLY the JSON object, nothing before or after."""
+
+
+def _normalize_language(language: str) -> str:
+    lang = (language or "").strip().lower()
+    aliases = {
+        "js": "javascript",
+        "ts": "typescript",
+        "py": "python",
+        "c++": "cpp",
+        "c#": "csharp",
+        "golang": "go",
+    }
+    return aliases.get(lang, lang or "plaintext")
+
+
+def _looks_like_language(code: str, language: str) -> bool:
+    """
+    Very lightweight heuristic to detect obvious language mismatches.
+    This is intentionally conservative: if unsure, return True.
+    """
+    lang = _normalize_language(language)
+    txt = (code or "").strip()
+    if not txt:
+        return True
+
+    # Markup/data languages
+    if lang in {"html", "xml", "svg"}:
+        return "<" in txt and ">" in txt
+    if lang in {"css", "scss", "sass", "less"}:
+        return "{" in txt and "}" in txt and ":" in txt
+    if lang == "json":
+        return txt[0] in "{[" and txt[-1] in "}]"
+    if lang in {"yaml", "yml"}:
+        return "\n" in txt and (":" in txt)
+
+    # Common programming languages (spot-check)
+    lowered = txt.lower()
+    if lang == "python":
+        return bool(re.search(r"^\s*(def |class |import |from )", txt, flags=re.M))
+    if lang in {"javascript", "typescript"}:
+        return any(k in lowered for k in ("function", "const ", "let ", "var ", "=>", "export ", "import "))
+    if lang in {"java", "kotlin"}:
+        return any(k in lowered for k in ("class ", "public ", "private ", "package ", "import "))
+    if lang in {"c", "cpp", "csharp"}:
+        return any(k in lowered for k in ("#include", "using ", "namespace", "class ", "int main", "public "))
+    if lang == "go":
+        return any(k in lowered for k in ("package ", "func ", "import "))
+    if lang == "rust":
+        return any(k in lowered for k in ("fn ", "use ", "mod ", "crate"))
+
+    # Unknown language: don't block.
+    return True
+
 
 
 def _strip_code_fence(text: str) -> str:
@@ -330,17 +426,34 @@ async def rewrite(request: RewriteRequest):
     if not code:
         raise HTTPException(status_code=400, detail="Code is required")
 
-    user_content = f"Rewrite this {request.language} code:\n```{request.language}\n{code}\n```"
+    language = _normalize_language(request.language)
+    strict_lang_guard = (
+        "CRITICAL: You MUST keep the code in the SAME LANGUAGE as the input. "
+        "Do NOT translate it into another language. "
+        "If the input is HTML/CSS/JSON/XML, return valid optimized HTML/CSS/JSON/XML only."
+    )
+    user_content = (
+        f"{strict_lang_guard}\n\n"
+        f"Rewrite this {language} code:\n```{language}\n{code}\n```"
+    )
     try:
         content = await _call_groq(
             [
-                {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+                {"role": "system", "content": REWRITE_SYSTEM_PROMPT + "\n\n" + strict_lang_guard},
                 {"role": "user", "content": user_content},
             ],
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=2048,
         )
         opt, explanation = _extract_rewrite_response(content, code)
+        if not _looks_like_language(opt, language) and _looks_like_language(code, language):
+            # Model returned code in the wrong language (e.g., Python for HTML).
+            # Prefer returning the original code rather than misleading output.
+            opt = code
+            explanation = (
+                explanation
+                or "The model returned output in a different language than requested. Please retry."
+            )
         return {
             "optimized_code": opt,
             "explanation": explanation,
